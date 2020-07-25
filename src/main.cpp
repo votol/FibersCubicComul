@@ -3,14 +3,24 @@
 #include <set>
 #include <list>
 #include <complex>
+#include <math.h>
 #include "yaml-cpp/yaml.h"
 #include "schema.h"
 #include "NetCdfWriter.h"
 #include "AbOA.h"
 #include "AbComul.h"
+#include "eqManager.h"
+#include "ParametersInit.h"
+#include "ParameterDefines.h"
+#include "ModelBuilder.h"
+#include "CLDataStorage.h"
+#include "CLmanager.h"
+#include "OutputWrapper.h"
+#include "OutputTime.h"
+#include "DERunge4.h"
 
 using namespace AbAl;
-
+using namespace clde;
 using POperator_a = std::map<int, std::uint8_t, std::greater<int>>;
 
 namespace AbAl
@@ -30,7 +40,7 @@ std::ostream& operator<<(std::ostream& os, const POperator_a& oper)
 }
 }
 
-Polynomial<POperator_a, int> antinormilize(const POperator& in)
+/*Polynomial<POperator_a, int> antinormilize(const POperator& in)
 {
     Polynomial<POperator_a, int> result;
     GOperator tmp_in;
@@ -159,7 +169,7 @@ void perform_test()
 
 void perform_test1(std::vector<unsigned int>& params)
 {
-    /*using lIndex = std::set<unsigned int>;
+    using lIndex = std::set<unsigned int>;
     using Poly = Polynomial<lIndex, double>;
     auto u = Poly(lIndex{1,2,3});
     auto v = Poly(lIndex{4,5});
@@ -177,7 +187,7 @@ void perform_test1(std::vector<unsigned int>& params)
             std::cout << "}^" << ind.second << " ";
         }
         std::cout << " : " <<el.second << std::endl;
-    }*/
+    }
     unsigned int com_order = 3;
     ComulManager manager(com_order);
     POperator oper = (a(params[0]) * a(params[2]) * a(params[3]) * a(params[4])).begin()->first;
@@ -237,16 +247,130 @@ void perform_test1(std::vector<unsigned int>& params)
     left += right * (-1);
     std::cout << left;
     //auto poly = manager.split((ak(1) * a(1) * a(1) * a(1) * a(2)).begin()->first);
+}*/
+
+void print(const clde::Polynomial& in)
+{
+    for(auto it = in.begin();it != in.end();++it)
+    {
+        std::cout << *it;
+        std::cout<<std::endl;
+    }
+    std::cout<<"----------------------"<<std::endl;
 }
+
+std::vector<double> calculate_init(const std::vector<double> in,
+                                   const clde::Polynomial& eqs,
+                                   const std::shared_ptr<ICLmanager>& context)
+{
+    CLDataStorage<double> in_vector(in, context);
+    OperatorDimension operDim = PolynomialOperator::calculateDimension(
+                eqs.begin(), eqs.end(), false);
+    operDim.in_dim = in.size() - 1;
+    CLDataStorage<double> out_vector(static_cast<unsigned int>(operDim.out_dim + 1), context);
+    PolynomialOperator oper(eqs.begin(),
+                            eqs.end(),
+                            1,
+                            operDim,
+                            context);
+
+    oper.apply(in_vector, out_vector, std::vector<double>());
+    return out_vector.read();
+}
+
+std::vector<double> load_init(const std::vector<double>& parameters, const std::string& path)
+{
+    size_t nfibs = static_cast<size_t>(Nfibs);
+    std::vector<double> result(1 + 2 * nfibs);
+    std::ifstream ifs;
+    double tmpd;
+
+    ifs.open (path + "/init.bin", std::ifstream::in | std::ifstream::binary);
+
+    for (unsigned int ind = 0; ind < nfibs; ind ++){
+        ifs.read(reinterpret_cast<char *>(&tmpd), 8);
+        result[1 + ind *2] = tmpd;
+        //vec[1 + ind *2] = 0.0;
+        result[2 + ind *2] = 0.0;
+    }
+
+    //vec[DI_r(0,0)] = 100.0;
+    result[0] = 1.0;
+    ifs.close();
+    return result;
+}
+
 
 int main(int argc, char **argv)
 {
-
     YAML::Node config = YAML::LoadFile(argv[1]);
     std::string output_dir = config["properties"]
 								  [FibersCubicComulSchema::PROPERTY_output_path].as<std::string>();
-    std::vector<std::unique_ptr<IOutput> > outputs(0);
+
+    ParametersHolder parameters_holder_instance(config["parameters"]);
+    std::shared_ptr<ICLmanager> manag = std::make_shared<CLmanager>(config["properties"]);
+
+    ModelBuilder model(parameters_holder_instance.GetParameters(), argv[2]);
+    //make main equations
+    OperatorDimension operDim = PolynomialOperator::calculateDimension(
+                model.main_equations().begin(), model.main_equations().end(), true);
+    PolynomialOperator oper(model.main_equations().begin(),
+                            model.main_equations().end(), 1, operDim, manag);
+
+    //make outputs
+    PolyOutputWrapper intens(model.intensity(),
+                             operDim,
+                             config["parameters"][FibersCubicComulSchema::PARAMETER_Nout].as<unsigned int>(),
+                             FibersCubicComulSchema::OUTPUT_I,
+                             manag);
+    PolyOutputWrapper third(model.third(),
+                             operDim,
+                             config["parameters"][FibersCubicComulSchema::PARAMETER_Nout].as<unsigned int>(),
+                             FibersCubicComulSchema::OUTPUT_TO,
+                             manag);
+
+    PolyOutputWrapper third_sp(model.third_sp(),
+                             operDim,
+                             config["parameters"][FibersCubicComulSchema::PARAMETER_Nout].as<unsigned int>(),
+                             FibersCubicComulSchema::OUTPUT_TO_s,
+                             manag);
+
+    OutputTime time(config["parameters"][FibersCubicComulSchema::PARAMETER_Nout].as<unsigned int>(),
+                    FibersCubicComulSchema::OUTPUT_time);
+
+    std::list<IDEOutput*> c_outputs;
+    c_outputs.push_back(intens.get_calc_pointer().get());
+    c_outputs.push_back(third.get_calc_pointer().get());
+    c_outputs.push_back(third_sp.get_calc_pointer().get());
+    c_outputs.push_back(time.get_calc_pointer().get());
+
+    // make init
+    std::vector<double> alphas = load_init(parameters_holder_instance.GetParameters(), config["properties"]
+            [FibersCubicComulSchema::PROPERTY_tmp_path].as<std::string>());
+    std::vector<double> init_state = calculate_init(alphas,
+                                                    model.init_calculation(),
+                                                    manag);
+    init_state[0] = 1.0;
+
+    //std::cout << "Dimension: " << init_state.size() << std::endl;
+    //std::cout << "Calc elements: " << model.main_equations().size() << std::endl;
+
+    DERunge4 calc(manag, &oper);
+    calc.SetTimeStep(config["parameters"][FibersCubicComulSchema::PARAMETER_dt].as<double>());
+    calc.SetStepsNumber(config["parameters"][FibersCubicComulSchema::PARAMETER_Nsteps].as<unsigned int>());
+    calc.SetOutputSteps(config["parameters"][FibersCubicComulSchema::PARAMETER_Nout].as<unsigned int>());
+    calc.SetInitState(init_state);
+    calc.SetOutputs(c_outputs);
+    calc.calculate();
+
+    std::vector<std::shared_ptr<IOutput> > outputs(4);
+    outputs[0] = intens.get_out_pointer();
+    outputs[1] = third.get_out_pointer();
+    outputs[2] = third_sp.get_out_pointer();
+    outputs[3] = time.get_out_pointer();
     NetCdfWriter netcdf_writer_instance(
-			output_dir + "/output.nc", outputs, 0);
+                output_dir + "/output.nc",
+                outputs,
+                config["parameters"][FibersCubicComulSchema::PARAMETER_Nout].as<unsigned int>());
     return 0;
 }
