@@ -21,4 +21,5 @@ after which in workDir will appear a directory with name revN, where N is some n
 In this directory will appear binary called CalcProj, it requaires .yaml file as it only input.
 See "test" folder for example, also please see description.yaml file for description of what should be placed 
 in "parameters" and "properties" section of this input .yaml file.
+
 If you have any questions about usage of the code, please contact martvo@ipfran.ru
